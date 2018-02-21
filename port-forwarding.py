@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # TCP Port Forwarding via Socks5 Socket
@@ -8,40 +8,152 @@
 #                   (adapted to socks5, use argparse for CLI invokation, etc.)
 
 import argparse
-import re
-import socks
+import hashlib
+import hmac
+import multiprocessing
+import os
+import select
 import socket
-import multiprocessing 
 import sys
+import re
+
+try:
+    import socks
+    from Crypto.Cipher import AES
+except:
+    print("Error: unsatisfied dependencies. Install Python packages with:")
+    print(" sudo pip3 install pyCrypto pysocks")
+    exit(1)
+
+NONCE_LENGTH = 16 
+
+
+
 
 def proxy_socket(proxy_type, proxy_addr, *args):
     s = socks.socksocket(*args)
     s.set_proxy(proxy_type, proxy_addr[0], proxy_addr[1])
     return s
 
+#-----------------------------------------------------------------------------
 
-def transfer(src, dst, direction):
+def get_cipher(key, nonce):
+    global NONCE_LENGTH
+    if type(key) == str:
+        key = key.encode("utf-8")
+    assert type(key) == bytes
+    assert type(nonce) == bytes and len(nonce) == NONCE_LENGTH
+    key = hmac.new(key, nonce, hashlib.sha256).digest()
+    cipher = AES.new(key=key, mode=AES.MODE_CFB, IV=nonce)
+    return cipher
+
+class ClientCryptoSocket:
+
+    def __init__(self, orig_socket, key):
+        self.__orig_socket = orig_socket
+        self.__key = key
+        self.__nonce = os.urandom(NONCE_LENGTH)
+        self.__cipher = get_cipher(key, self.__nonce)
+        self.__nonce_sent = False
+
+    def __getattr__(self, name):
+        return getattr(self.__orig_socket, name)
+
+    def recv(self, length):
+        recv_buffer = self.__orig_socket.recv(length)
+        return self.__cipher.decrypt(recv_buffer)
+
+    def send(self, data):
+        sending = self.__cipher.encrypt(data)
+        if not self.__nonce_sent:
+            sending = self.__nonce + sending
+            self.__nonce_sent = True
+        return self.__orig_socket.send(sending)
+
+
+class ServerCryptoSocket:
+
+    def __init__(self, orig_socket, key):
+        self.__orig_socket = orig_socket
+        self.__key = key
+        self.__cipher = None
+        self.__send_plaintext_buffer = b""
+
+    def __getattr__(self, name):
+        return getattr(self.__orig_socket, name)
+
+    def recv(self, length):
+        if not self.__cipher:
+            # cipher has to be initialized with a key and a nonce, the latter
+            # sent from remote
+            nonce_buffer = b""
+            while len(nonce_buffer) < NONCE_LENGTH:
+                recv = self.__orig_socket.recv(NONCE_LENGTH + length)
+                if len(recv) == 0:
+                    return b""
+                nonce_buffer += recv
+            nonce = nonce_buffer[:NONCE_LENGTH]
+            recv_buffer = nonce_buffer[NONCE_LENGTH:]
+            self.__cipher = get_cipher(self.__key, nonce)
+            print("[+] Incoming connection established!")
+        else:
+            recv_buffer = self.__orig_socket.recv(length)
+        # cipher is initialized
+        return self.__cipher.decrypt(recv_buffer)
+
+    def send(self, data):
+        self.__send_plaintext_buffer += data
+        if None == self.__cipher:
+            return len(data)
+        ret = self.__orig_socket.send(
+            self.__cipher.encrypt(self.__send_plaintext_buffer))
+        self.__send_plaintext_buffer = b""
+        return ret
+
+
+
+#-----------------------------------------------------------------------------
+
+def transfer(src, dst, timeout=300):
     src_name = src.getsockname()
     src_address = src_name[0]
     src_port = src_name[1]
     dst_name = dst.getsockname()
     dst_address = dst_name[0]
     dst_port = dst_name[1]
+    interval = 60
+    timeout_count = 0
     while True:
-        buffer = src.recv(0x400)
-        if len(buffer) == 0:
-            print "[-] No data received! Breaking..."
-            break
-        dst.send(buffer)
-    print "[+] Closing connecions! [%s:%d]" % (src_address, src_port)
+        readables, _, __ = select.select([src, dst], [], [], interval)
+        if readables:
+            timeout_count = 0
+        else:
+            timeout_count += interval
+            if timeout_count > timeout: break
+        exit = False
+        try:
+            for readable in readables:
+                buffer = readable.recv(0x400)
+                if len(buffer) == 0:
+                    print("[-] No data received! Breaking...")
+                    exit = True
+                if readable == src:
+                    dst.send(buffer)
+                else:
+                    src.send(buffer)
+        except Exception as e:
+            print(e)
+            exit = True
+        if exit: break
+    print("[+] Closing connecions! [%s:%d]" % (src_address, src_port))
     #src.shutdown(socket.SHUT_RDWR)
     src.close()
-    print "[+] Closing connecions! [%s:%d]" % (dst_address, dst_port)
+    print("[+] Closing connecions! [%s:%d]" % (dst_address, dst_port))
     #dst.shutdown(socket.SHUT_RDWR)
     dst.close()
 
 
-def server(src_address, dst_address, proxy_config, max_connection):
+def server(src_address, dst_address, proxy_config, max_connection, cs, cc):
     if proxy_config:
         proxy_type, proxy_addr = proxy_config
         get_remote_socket = lambda: proxy_socket(
@@ -49,36 +161,42 @@ def server(src_address, dst_address, proxy_config, max_connection):
     else:
         get_remote_socket = lambda: socket.socket(
             socket.AF_INET, socket.SOCK_STREAM)
-        
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(src_address)
     server_socket.listen(max_connection)
-    print '[+] Server started [%s:%d] -> [%s:%d]' % (src_address + dst_address)
+    print('[+] Server started [%s:%d] -> [%s:%d]' % (src_address + dst_address))
     while True:
         local_socket, local_address = server_socket.accept()
-        print '[+] Detect connection from [%s:%s]' % local_address
-        print "[+] Trying to connect the REMOTE server [%s:%d]" % dst_address
+        if cs:
+            print('[+] Local port behaving as cipher end-point.')
+            local_socket = ServerCryptoSocket(local_socket, cs)
+
+        print('[+] Detect connection from [%s:%s]' % local_address)
+        print("[+] Trying to connect the REMOTE server [%s:%d]" % dst_address)
         remote_socket = get_remote_socket()
+        if cc:
+            print('[+] Forwarding data from a cipher end-point.')
+            remote_socket = ClientCryptoSocket(remote_socket, cc)
         remote_socket.connect(dst_address)
-        print "[+] Tunnel connected! Tranfering data..."
+
+        print("[+] Tunnel connected! Tranfering data...")
         s = multiprocessing.Process(target=transfer, args=(
-            remote_socket, local_socket, False))
-        r = multiprocessing.Process(target=transfer, args=(
-            local_socket, remote_socket, True))
+            remote_socket, local_socket))
+#        r = multiprocessing.Process(target=transfer, args=(
+#            local_socket, remote_socket, True))
         s.start()
-        r.start()
-    print "[+] Releasing resources..."
+#        r.start()
+    print("[+] Releasing resources...")
     remote_socket.shutdown(socket.SHUT_RDWR)
     remote_socket.close()
     local_socket.shutdown(socket.SHUT_RDWR)
     local_socket.close()
-    print "[+] Closing server..."
+    print("[+] Closing server...")
     server_socket.shutdown(socket.SHUT_RDWR)
     server_socket.close()
-    print "[+] Server shuted down!"
+    print("[+] Server shut down!")
 
 
 def parse_addr(string, default_port=1080):
@@ -96,11 +214,30 @@ def main():
     parser = argparse.ArgumentParser(description="""
         A tool for port forwarding over a SOCKS4/5 Proxy. Currently only simple
         SOCKS proxies without authentication are supported.
+    """, epilog="""
+        On encryption: this program may pair 2 computers with one running with
+        -cc/--crypto-client and another with -cs/--crypto-server option.
+        Initiating this program with both options is also possible, in which
+        way it will work as a relay decrypting and re-encrypting the data
+        stream in transit using 2 different keys.
     """)
 
-    group = parser.add_mutually_exclusive_group(required=False)
-    group.add_argument("--socks4", "-s4", help="Use a SOCKS4 proxy.")
-    group.add_argument("--socks5", "-s5", help="Use a SOCKS5 proxy.")
+    proxy = parser.add_mutually_exclusive_group(required=False)
+    proxy.add_argument("--socks4", "-s4", help="Use a SOCKS4 proxy.")
+    proxy.add_argument("--socks5", "-s5", help="Use a SOCKS5 proxy.")
+
+    parser.add_argument(
+        "--crypto-server", "-cs",
+        metavar="PASSWORD",
+        help="""Experimental. Regard the incoming proxy stream as encrypted by
+        this program under -cc/--crypto-client option. See below.""")
+
+    parser.add_argument(
+        "--crypto-client", "-cc",
+        metavar="PASSWORD",
+        help="""Experimental. Proxied stream targeting the remote address will
+        be encrypted, and can be decrypted only with another instance of this
+        program started with -cs/--crypto-server option. See below.""")
 
     parser.add_argument(
         "src_address",
@@ -121,7 +258,9 @@ def main():
         proxy_config = socks.SOCKS5, parse_addr(args.socks5)
 
     MAX_CONNECTION = 0x10
-    server(src_address, dst_address, proxy_config, MAX_CONNECTION)
+    server(
+        src_address, dst_address, proxy_config, MAX_CONNECTION,
+        cs=args.crypto_server, cc=args.crypto_client)
 
 
 if __name__ == "__main__":
