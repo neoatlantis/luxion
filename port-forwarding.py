@@ -5,7 +5,7 @@
 # Original Author : WangYihang <wangyihanger@gmail.com> (for port forwarding)
 #                   (As gist: <https://gist.github.com/WangYihang/e7d36b744557e4673d2157499f6c6b5e>)
 # Changes         : NeoAtlantis <aurichalka@gmail.com> 
-#                   (adapted to socks5, use argparse for CLI invokation, etc.)
+#                   (adapted to pySocks, argparse for CLI invokation, encryption, etc.)
 
 import argparse
 import hashlib
@@ -30,10 +30,19 @@ NONCE_LENGTH = 16
 
 
 
-def proxy_socket(proxy_type, proxy_addr, *args):
+def proxy_socket(proxy_type, proxy_addr, proxy_timeout, *args):
     s = socks.socksocket(*args)
     s.set_proxy(proxy_type, proxy_addr[0], proxy_addr[1])
+    if proxy_timeout and proxy_timeout > 0:
+        s.settimeout(proxy_timeout)
     return s
+
+def clear_sockets(*sockets):
+    for each in sockets:
+        try:
+            each.close()
+        except:
+            pass
 
 #-----------------------------------------------------------------------------
 
@@ -147,17 +156,17 @@ def transfer(src, dst, timeout=300):
         if exit: break
     print("[+] Closing connecions! [%s:%d]" % (src_address, src_port))
     #src.shutdown(socket.SHUT_RDWR)
-    src.close()
     print("[+] Closing connecions! [%s:%d]" % (dst_address, dst_port))
     #dst.shutdown(socket.SHUT_RDWR)
-    dst.close()
+    clear_sockets(src, dst)
 
 
 def server(src_address, dst_address, proxy_config, max_connection, cs, cc):
     if proxy_config:
-        proxy_type, proxy_addr = proxy_config
+        proxy_type, proxy_addr, proxy_timeout = proxy_config
         get_remote_socket = lambda: proxy_socket(
-            proxy_type, proxy_addr, socket.AF_INET, socket.SOCK_STREAM)
+            proxy_type, proxy_addr, proxy_timeout, socket.AF_INET,
+            socket.SOCK_STREAM)
     else:
         get_remote_socket = lambda: socket.socket(
             socket.AF_INET, socket.SOCK_STREAM)
@@ -179,7 +188,14 @@ def server(src_address, dst_address, proxy_config, max_connection, cs, cc):
         if cc:
             print('[+] Forwarding data from a cipher end-point.')
             remote_socket = ClientCryptoSocket(remote_socket, cc)
-        remote_socket.connect(dst_address)
+
+        try:
+            remote_socket.connect(dst_address)
+        except:
+            print("[-] Error: cannot connect to proxy.")
+            clear_sockets(remote_socket, local_socket)
+            continue
+            #exit(2)
 
         print("[+] Tunnel connected! Tranfering data...")
         s = multiprocessing.Process(target=transfer, args=(
@@ -225,19 +241,27 @@ def main():
     proxy = parser.add_mutually_exclusive_group(required=False)
     proxy.add_argument("--socks4", "-s4", help="Use a SOCKS4 proxy.")
     proxy.add_argument("--socks5", "-s5", help="Use a SOCKS5 proxy.")
+    proxy.add_argument("--http", help="Use a HTTP CONNECT proxy.")
+
+    parser.add_argument(
+        "--timeout", "-t",
+        metavar="SECONDS",
+        type=int,
+        help="Set a timeout for proxy. Only useful if any proxy is set."
+    )
 
     parser.add_argument(
         "--crypto-server", "-cs",
         metavar="PASSWORD",
-        help="""Experimental. Regard the incoming proxy stream as encrypted by
-        this program under -cc/--crypto-client option. See below.""")
+        help="""Regard the incoming proxy stream as encrypted by this program
+        under -cc/--crypto-client option. See below.""")
 
     parser.add_argument(
         "--crypto-client", "-cc",
         metavar="PASSWORD",
-        help="""Experimental. Proxied stream targeting the remote address will
-        be encrypted, and can be decrypted only with another instance of this
-        program started with -cs/--crypto-server option. See below.""")
+        help="""Proxied stream targeting the remote address will be encrypted,
+        and can be decrypted only with another instance of this program started
+        with -cs/--crypto-server option. See below.""")
 
     parser.add_argument(
         "src_address",
@@ -252,10 +276,13 @@ def main():
     src_address = parse_addr(args.src_address)
     dst_address = parse_addr(args.dst_address, default_port=src_address[1])
     proxy_config = None
+
     if args.socks4:
-        proxy_config = socks.SOCKS4, parse_addr(args.socks4)
+        proxy_config = socks.SOCKS4, parse_addr(args.socks4), args.timeout
     if args.socks5:
-        proxy_config = socks.SOCKS5, parse_addr(args.socks5)
+        proxy_config = socks.SOCKS5, parse_addr(args.socks5), args.timeout
+    if args.http:
+        proxy_config = socks.HTTP, parse_addr(args.http), args.timeout
 
     MAX_CONNECTION = 0x10
     server(
