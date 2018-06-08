@@ -1,4 +1,6 @@
-class LBE128Stream:
+#!/usr/bin/env python3
+
+class LEB128Stream:
 
     def __init__(self):
         self.byteTo8bit = {

@@ -17,17 +17,17 @@ import socket
 import sys
 import re
 
-from .LBE128 import LBE128Stream
+from .LEB128 import LEB128Stream
+from .cipher import get_cipher
 
 try:
     import socks
-    from Crypto.Cipher import AES
+    import Crypto.Cipher
 except:
     print("Error: unsatisfied dependencies. Install Python packages with:")
     print(" sudo pip3 install pyCrypto pysocks")
     exit(1)
 
-NONCE_LENGTH = 16 
 
 
 
@@ -81,17 +81,6 @@ def clear_sockets(*sockets):
 # immediately.
 # 
 
-def get_cipher(key, nonce):
-    global NONCE_LENGTH
-    if type(key) == str:
-        key = key.encode("utf-8")
-    assert type(key) == bytes
-    assert type(nonce) == bytes and len(nonce) == NONCE_LENGTH
-    key = hmac.new(key, nonce, hashlib.sha256).digest()
-    cipher = AES.new(key=key, mode=AES.MODE_CFB, IV=nonce)
-    return cipher
-
-
 class AuthenticatedPacketStream:
 
     def __init__(self, key):
@@ -101,7 +90,7 @@ class AuthenticatedPacketStream:
         key = hashlib.sha512(key).digest()
         self.__hmac = hmac.new(key, b"", hashlib.sha256)
         self.__hmac_len = 32
-        self.__stream = LBE128Stream()
+        self.__stream = LEB128Stream()
 
     def __hash(self, data):
         h = self.__hmac.copy()
